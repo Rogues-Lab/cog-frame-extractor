@@ -1,0 +1,15 @@
+# Configuration for Cog ⚙️
+# Reference: https://cog.run/yaml
+
+build:
+  gpu: false
+  python_version: "3.11"
+  python_packages:
+    - "opencv-python==4.8.0.74"
+    - "numpy==1.24.3"
+  system_packages:
+    - "ffmpeg"
+    - "libsm6"
+    - "libxext6"
+
+predict: "predict.py:Predictor"
