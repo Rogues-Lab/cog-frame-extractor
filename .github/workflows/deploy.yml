@@ -1,0 +1,30 @@
+name: Deploy cog-audio-extract
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Cog
+        uses: replicate/setup-cog@v2
+        with:
+          token: ${{ secrets.REPLICATE_API_TOKEN }}
+          
+      - name: Debug - Check current location
+        run: |
+          pwd
+          ls -la
+          
+      - name: Deploy to Replicate
+        run: cog push r8.im/darrenrogan/cog-frame-reference-extractor
+        env:
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
