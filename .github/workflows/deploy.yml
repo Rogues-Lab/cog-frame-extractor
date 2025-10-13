@@ -1,4 +1,4 @@
-name: Deploy cog-audio-extract
+name: Deploy cog-frame-extractor
 
 on:
   push:
@@ -25,6 +25,6 @@ jobs:
           ls -la
           
       - name: Deploy to Replicate
-        run: cog push r8.im/darrenrogan/cog-frame-reference-extractor
+        run: cog push r8.im/darrenrogan/cog-frame-extractor
         env:
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
