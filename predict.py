@@ -6,6 +6,8 @@ import cv2
 import numpy as np
 from cog import BasePredictor, Input, Path
 
+from helpers import select_frame_index
+
 
 class Predictor(BasePredictor):
     def setup(self):
@@ -41,18 +43,12 @@ class Predictor(BasePredictor):
         if frame_count == 0:
             raise ValueError(f"Video file contains no frames: {video}")
             
-        if return_first_frame:
-            # Set to first frame
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
-            if not ret:
-                raise ValueError("Failed to read first frame")
-        else:
-            # Set to last frame
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
-            ret, frame = cap.read()
-            if not ret:
-                raise ValueError("Failed to read last frame")
+        target_index = select_frame_index(frame_count, return_first_frame)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_index)
+        ret, frame = cap.read()
+        if not ret:
+            label = "first" if return_first_frame else "last"
+            raise ValueError(f"Failed to read {label} frame")
                 
         # Save the frame as an image
         cv2.imwrite(output_path, frame)
