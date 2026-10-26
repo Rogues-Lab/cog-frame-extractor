@@ -1,1 +1,5 @@
 pytest>=7.4.0
+# predict-level tests (cog.yaml pins opencv-python; headless has the same FFmpeg backend)
+cog
+opencv-python-headless==4.8.0.74
+numpy==1.24.3
