@@ -13,7 +13,7 @@ import pytest
 import media_guard as mg
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
-needs_ffmpeg = pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+needs_ffmpeg = pytest.mark.skipif(not mg.real_binary("ffmpeg"), reason="ffmpeg not installed")
 
 STORAGE = "https://vqzoyuvdarpfptuhhsws.supabase.co/storage/v1/object/public"
 PUBLIC_RESOLVE = lambda host: ["104.18.38.10"]  # noqa: E731
@@ -60,10 +60,14 @@ def test_font_hosts_are_opt_in():
 
 def test_private_ip_resolution_is_refused():
     url = f"{STORAGE}/a.mp4"
-    for addr in ("10.1.2.3", "169.254.169.254", "127.0.0.1", "::1", "fd00::1", "::ffff:10.0.0.1", "100.64.0.1"):
+    for addr in ("10.1.2.3", "169.254.169.254", "127.0.0.1", "::1", "fd00::1", "::ffff:10.0.0.1", "100.64.0.1",
+                 "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "::7f00:1", "2002:7f00:1::", "2002:a9fe:a9fe::1",
+                 "2001:0:4136:e378:8000:63bf:3fff:fdd2"):
         with pytest.raises(mg.UnsafeInput):
             mg.check_resolves_public(url, resolve=lambda h, a=addr: [a])
     mg.check_resolves_public(url, resolve=PUBLIC_RESOLVE)
+    assert mg.is_public_ip("64:ff9b::808:808")  # NAT64 of a public address
+    assert mg.is_public_ip("2606:4700::6810:260a")
 
 
 # --- download --------------------------------------------------------------
@@ -213,6 +217,20 @@ def test_cube_lut_check(tmp_path):
 
 # --- wrappers --------------------------------------------------------------
 
+@pytest.fixture
+def restore_guard(monkeypatch):
+    """Tests install wrappers around fake binaries; undo that afterwards."""
+    for k in ("PATH", "FFMPEG_BINARY", "IMAGEIO_FFMPEG_EXE", "OPENCV_FFMPEG_CAPTURE_OPTIONS"):
+        if k in os.environ:
+            monkeypatch.setenv(k, os.environ[k])
+        else:
+            monkeypatch.delenv(k, raising=False)
+    saved = dict(mg._state)
+    yield
+    mg._state.clear()
+    mg._state.update(saved)
+
+
 def _fake_tool(tmp_path, name):
     log = tmp_path / f"{name}.log"
     tool = tmp_path / f"real-{name}"
@@ -221,39 +239,111 @@ def _fake_tool(tmp_path, name):
     return str(tool), log
 
 
-def test_wrappers_whitelist_every_input_and_strip_env(tmp_path, monkeypatch):
+@pytest.fixture
+def fake(tmp_path, monkeypatch, restore_guard):
     ff, fflog = _fake_tool(tmp_path, "ffmpeg")
     fp, fplog = _fake_tool(tmp_path, "ffprobe")
     monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_secret")
-    monkeypatch.setenv("PATH", os.environ["PATH"])
+    mg._state.clear()
     info = mg.install_ffmpeg_guard(real_ffmpeg=ff, real_ffprobe=fp, real_imageio_ffmpeg=ff, bin_dir=str(tmp_path / "bin"))
+
+    def run(tool, *args):
+        log = fflog if tool == "ffmpeg" else fplog
+        if log.exists():
+            log.unlink()
+        r = subprocess.run([tool, *args], capture_output=True, text=True)
+        if r.returncode != 0:
+            return r, None, None
+        a, env = log.read_text().split("ENV\n")
+        return r, a.splitlines(), env
+
+    return info, run
+
+
+FORCED = ["-protocol_whitelist", mg.PROTOCOL_WHITELIST, "-format_whitelist", mg.FORMAT_WHITELIST]
+
+
+def test_wrappers_force_whitelists_on_every_input_and_strip_env(fake):
+    info, run = fake
     assert shutil.which("ffmpeg") == info["ffmpeg"]
     assert os.environ["FFMPEG_BINARY"] == info["imageio_ffmpeg"] == os.environ["IMAGEIO_FFMPEG_EXE"]
     assert "format_whitelist;" in os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]
-
-    subprocess.run(["ffmpeg", "-y", "-i", "a.mp4", "-f", "lavfi", "-i", "anullsrc",
-                    "-format_whitelist", "concat", "-f", "concat", "-i", "list.txt", "out.mp4"], check=True)
-    args, env = fflog.read_text().split("ENV\n")
-    args = args.splitlines()
-    assert args.count("-i") == 3
-    assert args.count("-protocol_whitelist") == 3
-    assert args.count("-format_whitelist") == 3  # the explicit one is kept, not doubled
+    r, args, env = run("ffmpeg", "-y", "-i", "a.mp4", "-f", "lavfi", "-i", "anullsrc", *mg.input_args("/w/b.mp4", "mp4"), "out.mp4")
+    assert r.returncode == 0, r.stderr
+    assert args.count("-i") == 3 and args.count("-protocol_whitelist") == 3 and args.count("-format_whitelist") == 3
     first = args.index("-i")
-    assert args[first - 4:first] == ["-protocol_whitelist", mg.PROTOCOL_WHITELIST, "-format_whitelist", mg.FORMAT_WHITELIST]
+    assert args[first - 4:first] == FORCED
     assert "REPLICATE_API_TOKEN" not in env and "r8_secret" not in env
+    r, pargs, penv = run("ffprobe", "-v", "error", "a.mp4")
+    assert pargs[:4] == FORCED and "r8_secret" not in penv
 
-    subprocess.run(["ffprobe", "-v", "error", "a.mp4"], check=True)
-    pargs, penv = fplog.read_text().split("ENV\n")
-    assert pargs.splitlines()[:4] == ["-protocol_whitelist", mg.PROTOCOL_WHITELIST, "-format_whitelist", mg.FORMAT_WHITELIST]
-    assert "r8_secret" not in penv
+
+@pytest.mark.parametrize("tool", ["ffmpeg", "ffprobe"])
+def test_whitelist_tokens_inside_a_filename_do_not_suppress_the_forced_flags(fake, tool):
+    _, run = fake
+    name = "x -protocol_whitelist file,http -format_whitelist hls .mp4"
+    r, args, _ = run(tool, "-i", name, "o.mp4") if tool == "ffmpeg" else run(tool, name)
+    assert r.returncode == 0, r.stderr
+    assert args.count("-protocol_whitelist") == 1 and args[args.index("-protocol_whitelist") + 1] == mg.PROTOCOL_WHITELIST
+    assert args[args.index("-format_whitelist") + 1] == mg.FORMAT_WHITELIST
+    assert name in args
+
+
+@pytest.mark.parametrize("tool", ["ffmpeg", "ffprobe"])
+@pytest.mark.parametrize("extra", [
+    ["-protocol_whitelist", "file,http,tcp"], ["-format_whitelist", "hls,mov"], ["-format_whitelist", "concat"],
+    ["-pattern_type", "glob"], ["-enable_drefs", "1"],
+])
+def test_caller_cannot_loosen_the_whitelists(fake, tool, extra):
+    _, run = fake
+    r, _, _ = run(tool, *extra, "-i", "a.mp4", "o.mp4")
+    assert r.returncode == 2 and "media_guard" in r.stderr
+
+
+def _media(path):
+    path.write_bytes(b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 64)
+
+
+def test_concat_only_for_our_own_list(fake, tmp_path):
+    _, run = fake
+    work = tmp_path / "work"
+    work.mkdir()
+    _media(work / "part-0000.m4a")
+    _media(work / "part-0001.m4a")
+    (work / "list.txt").write_text("file 'part-0000.m4a'\nfile 'part-0001.m4a'\n")
+    r, _, _ = run("ffmpeg", "-f", "concat", "-safe", "0", "-i", str(work / "list.txt"), "o.m4a")
+    assert r.returncode == 2  # dir not registered: user-style concat is refused
+    mg.allow_concat_dir(str(work))
+    r, args, _ = run("ffmpeg", "-f", "concat", "-safe", "0", "-i", str(work / "list.txt"), "o.m4a")
+    assert r.returncode == 0, r.stderr
+    i = args.index("-i")
+    assert args[i - 6:i] == ["-protocol_whitelist", "file", "-format_whitelist", mg.FORMAT_WHITELIST + ",concat", "-safe", "1"]
+    assert "0" not in args[:i - 6]  # the caller's -safe 0 was dropped
+    (work / "notes.txt").write_text("hello")
+    for body in ("file '/etc/passwd'\n", "file '../x.m4a'\n", "file 'http://169.254.169.254/'\n",
+                 "file 'notes.txt'\n", "file 'missing.m4a'\n", "ffconcat version 1.0\n", "option x 1\nfile 'part-0000.m4a'\n"):
+        (work / "evil.txt").write_text(body)
+        r, _, _ = run("ffmpeg", "-f", "concat", "-i", str(work / "evil.txt"), "o.m4a")
+        assert r.returncode == 2, body
+    os.symlink("/etc/passwd", work / "link.m4a")
+    (work / "evil.txt").write_text("file 'link.m4a'\n")
+    assert run("ffmpeg", "-f", "concat", "-i", str(work / "evil.txt"), "o.m4a")[0].returncode == 2
+    mg.clear_concat_dirs()
+    assert run("ffmpeg", "-f", "concat", "-i", str(work / "list.txt"), "o.m4a")[0].returncode == 2
+    assert run("ffprobe", "-f", "concat", str(work / "list.txt"))[0].returncode == 2
+
+
+def test_image2pipe_only_from_stdin(fake, tmp_path):
+    _, run = fake
+    assert run("ffmpeg", "-f", "image2pipe", "-i", "-", "o.mp4")[0].returncode == 0
+    assert run("ffmpeg", "-f", "image2pipe", "-i", str(tmp_path / "x.png"), "o.mp4")[0].returncode == 2
 
 
 # --- real ffmpeg (the attacks themselves) ------------------------------------
 
 @pytest.fixture
-def guarded(tmp_path, monkeypatch):
-    monkeypatch.setenv("PATH", os.environ["PATH"])
-    real = {k: shutil.which(k) for k in ("ffmpeg", "ffprobe")}
+def guarded(tmp_path, restore_guard):
+    real = {k: mg.real_binary(k) for k in ("ffmpeg", "ffprobe")}  # never a guard installed earlier
     mg._state.clear()
     return mg.install_ffmpeg_guard(real_ffmpeg=real["ffmpeg"], real_ffprobe=real["ffprobe"],
                                    real_imageio_ffmpeg=real["ffmpeg"], bin_dir=str(tmp_path / "bin"))
@@ -294,3 +384,34 @@ def test_guarded_ffmpeg_processes_normal_media(tmp_path, guarded):
     r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "4x4", "-r", "1", "-i", "-",
                         str(tmp_path / "raw.mp4")], input=b"\x00" * 48, capture_output=True)
     assert r.returncode == 0, r.stderr
+
+
+@needs_ffmpeg
+def test_guarded_ffmpeg_runs_our_concat_list(tmp_path, guarded):
+    work = tmp_path / "work"
+    work.mkdir()
+    for n in ("a.mp4", "b.mp4"):
+        _tiny_mp4(work / n)
+    (work / "list.txt").write_text("file 'a.mp4'\nfile 'b.mp4'\n")
+    mg.allow_concat_dir(str(work))
+    out = tmp_path / "joined.mp4"
+    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(work / "list.txt"), "-c", "copy", str(out)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(out)], capture_output=True, text=True)
+    assert 1.8 < float(r.stdout) < 2.3
+
+
+def test_a_second_install_wraps_the_real_binary_not_the_first_wrapper(tmp_path, restore_guard):
+    if not mg.real_binary("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    mg._state.clear()
+    first = mg.install_ffmpeg_guard(bin_dir=str(tmp_path / "b1"))
+    mg._state.clear()
+    second = mg.install_ffmpeg_guard(bin_dir=str(tmp_path / "b2"))
+    for key in ("ffmpeg", "imageio_ffmpeg"):
+        body = open(second[key]).read()
+        assert str(tmp_path / "b1") not in body and mg.is_guard_wrapper(second[key])
+    assert mg.real_binary("ffmpeg") and not mg.is_guard_wrapper(mg.real_binary("ffmpeg"))
+    with pytest.raises(RuntimeError):
+        mg._write_wrapper(str(tmp_path / "x"), "ffmpeg", first["ffmpeg"], second["concat_dirs"])
