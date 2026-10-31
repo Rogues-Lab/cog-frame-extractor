@@ -15,11 +15,21 @@ import media_guard as mg
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 needs_ffmpeg = pytest.mark.skipif(not mg.real_binary("ffmpeg"), reason="ffmpeg not installed")
 
+# SHA-256 of the canonical media_guard.py: every vendored copy must match.
+MEDIA_GUARD_SHA256 = "551bedde476ed9c38ed175584d063156f16a86f0e30b5b62c1fdf432a0002956"
 STORAGE = "https://vqzoyuvdarpfptuhhsws.supabase.co/storage/v1/object/public"
 PUBLIC_RESOLVE = lambda host: ["104.18.38.10"]  # noqa: E731
 
 HLS_WITH_HTTP = b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nhttp://169.254.169.254/latest/meta-data/x.ts\n#EXT-X-ENDLIST\n"
 FFCONCAT_PASSWD = b"ffconcat version 1.0\nfile '/etc/passwd'\n"
+
+
+def test_vendored_copy_is_the_canonical_one():
+    import hashlib
+    with open(mg.__file__, "rb") as f:
+        assert hashlib.sha256(f.read()).hexdigest() == MEDIA_GUARD_SHA256, (
+            "media_guard.py differs from the canonical copy: re-vendor it, never edit it in place")
+    assert mg.GUARD_VERSION == "3"
 
 
 # --- links -----------------------------------------------------------------
@@ -61,12 +71,17 @@ def test_font_hosts_are_opt_in():
 def test_private_ip_resolution_is_refused():
     url = f"{STORAGE}/a.mp4"
     for addr in ("10.1.2.3", "169.254.169.254", "127.0.0.1", "::1", "fd00::1", "::ffff:10.0.0.1", "100.64.0.1",
-                 "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "::7f00:1", "2002:7f00:1::", "2002:a9fe:a9fe::1",
-                 "2001:0:4136:e378:8000:63bf:3fff:fdd2"):
+                 "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "64:ff9b::a00:1", "64:ff9b:1::a00:1", "64:ff9b:1::808:808",
+                 "::7f00:1", "::808:808", "2002:7f00:1::", "2002:a00:1::", "2002:808:808::1",
+                 "2001:0:4136:e378:8000:63bf:3fff:fdd2", "::", "::1"):
         with pytest.raises(mg.UnsafeInput):
             mg.check_resolves_public(url, resolve=lambda h, a=addr: [a])
     mg.check_resolves_public(url, resolve=PUBLIC_RESOLVE)
-    assert mg.is_public_ip("64:ff9b::808:808")  # NAT64 of a public address
+    assert mg.is_public_ip("64:ff9b::808:808")  # well-known NAT64 of 8.8.8.8
+    assert not mg.is_public_ip("::ffff:10.0.0.1") and mg.is_public_ip("::ffff:8.8.8.8")
+    # a public NAT64 answer passes only for a host that is allowlisted anyway
+    mg.check_resolves_public(url, resolve=lambda h: ["64:ff9b::808:808"])
+    assert not mg.is_allowed_url("https://nat64-public.example/a.mp4")
     assert mg.is_public_ip("2606:4700::6810:260a")
 
 

@@ -1,8 +1,10 @@
 """media_guard: untrusted-media hardening shared by the film.fun cogs.
 
 VENDORED: every cog repo carries its own copy (cogs are separate builds).
-The canonical copy and its tests live in each repo as media_guard.py and
-tests/test_media_guard.py; keep them identical across repos (bump GUARD_VERSION).
+Copy media_guard.py and tests/test_media_guard.py VERBATIM from the canonical
+pair; never edit one repo's copy. tests/test_media_guard.py pins this file's
+SHA-256, so a diverged copy fails that cog's CI. To change it: edit, bump
+GUARD_VERSION, update MEDIA_GUARD_SHA256 in the test, re-vendor everywhere.
 
 Threat: a caller-supplied URL or file makes ffmpeg/ffprobe/moviepy/OpenCV
 fetch other URLs (SSRF: HLS/m3u8, DASH, RTSP/RTP/SDP …) or read local files
@@ -36,7 +38,7 @@ import urllib.parse
 import urllib.request
 from typing import Iterable, Optional, Sequence, Tuple
 
-GUARD_VERSION = "2"
+GUARD_VERSION = "3"
 
 
 class UnsafeInput(ValueError):
@@ -110,29 +112,29 @@ def is_allowed_url(url: str, extra_host_suffixes: Sequence[str] = ()) -> bool:
         return False
 
 
-_NAT64 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
-_V4COMPAT = ipaddress.ip_network("::/96")
-
-
-def _embedded_v4(ip):
-    """The IPv4 address an IPv6 transition address carries (None if none)."""
-    if ip.ipv4_mapped:
-        return ip.ipv4_mapped
-    if ip.sixtofour:
-        return ip.sixtofour
-    if any(ip in n for n in _NAT64) or (ip in _V4COMPAT and int(ip) > 1):
-        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
-    return None
+_NAT64_WKP = ipaddress.ip_network("64:ff9b::/96")  # well-known prefix: embeds a real IPv4
+_DENY_V6 = (
+    ipaddress.ip_network("64:ff9b:1::/48"),  # NAT64 local-use (RFC 8215): network-specific, never public
+    ipaddress.ip_network("2002::/16"),  # 6to4
+    ipaddress.ip_network("2001::/32"),  # Teredo
+    ipaddress.ip_network("::/96"),  # deprecated IPv4-compatible (and ::, ::1)
+)
 
 
 def is_public_ip(addr: str) -> bool:
+    """True only for a global unicast address. IPv6 transition forms are
+    denied, except IPv4-mapped and well-known-prefix NAT64, whose embedded
+    IPv4 must itself be public."""
     ip = ipaddress.ip_address(addr.split("%", 1)[0])
     if isinstance(ip, ipaddress.IPv6Address):
-        if ip.teredo:
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip in _NAT64_WKP:
+            if not ip.is_global or ip.is_multicast:  # the IPv6 form must pass too
+                return False
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        elif any(ip in n for n in _DENY_V6):
             return False
-        v4 = _embedded_v4(ip)
-        if v4 is not None:
-            ip = v4
     return bool(ip.is_global) and not ip.is_multicast
 
 
