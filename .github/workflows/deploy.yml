@@ -1,6 +1,7 @@
 name: Deploy cog-frame-extractor
 
 on:
+  pull_request:
   push:
     branches:
       - main
@@ -19,6 +20,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install ffmpeg (predict + security tests)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Install dev deps
         run: pip install -r requirements-dev.txt
 
@@ -27,6 +31,7 @@ jobs:
 
   deploy:
     needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     
     steps:
