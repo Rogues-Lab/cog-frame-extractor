@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 from typing import Iterable, Optional, Sequence, Tuple
 
-GUARD_VERSION = "1"
+GUARD_VERSION = "2"
 
 
 class UnsafeInput(ValueError):
@@ -110,10 +110,29 @@ def is_allowed_url(url: str, extra_host_suffixes: Sequence[str] = ()) -> bool:
         return False
 
 
+_NAT64 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
+_V4COMPAT = ipaddress.ip_network("::/96")
+
+
+def _embedded_v4(ip):
+    """The IPv4 address an IPv6 transition address carries (None if none)."""
+    if ip.ipv4_mapped:
+        return ip.ipv4_mapped
+    if ip.sixtofour:
+        return ip.sixtofour
+    if any(ip in n for n in _NAT64) or (ip in _V4COMPAT and int(ip) > 1):
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
 def is_public_ip(addr: str) -> bool:
     ip = ipaddress.ip_address(addr.split("%", 1)[0])
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.teredo:
+            return False
+        v4 = _embedded_v4(ip)
+        if v4 is not None:
+            ip = v4
     return bool(ip.is_global) and not ip.is_multicast
 
 
@@ -382,52 +401,186 @@ def subprocess_env(extra: Optional[dict] = None) -> dict:
 # Every other ffmpeg/ffprobe run (moviepy, imageio, bare "ffmpeg", OpenCV)
 # ---------------------------------------------------------------------------
 
-_FFMPEG_WRAPPER = r"""#!/bin/bash
-# media_guard ffmpeg wrapper: whitelists on every input, empty environment.
-args=()
-pw=0
-fw=0
-for a in "$@"; do
-  if [ "$a" = "-i" ]; then
-    [ "$pw" = 0 ] && args+=("-protocol_whitelist" "__PW__")
-    [ "$fw" = 0 ] && args+=("-format_whitelist" "__FW__")
-    pw=0
-    fw=0
-  fi
-  [ "$a" = "-protocol_whitelist" ] && pw=1
-  [ "$a" = "-format_whitelist" ] && fw=1
-  args+=("$a")
-done
-exec /usr/bin/env -i __ENV__ "__REAL__" "${args[@]}"
-"""
+# The wrapper is a stdlib-only Python script run with -IS. It walks argv by
+# exact equality (never a string match on the joined command line):
+# - forces -protocol_whitelist/-format_whitelist on every input; a caller's own
+#   whitelist flag is refused unless it is exactly media_guard's value;
+# - refuses -pattern_type and -enable_drefs, drops a caller's -safe;
+# - allows -f concat only for a list inside a directory registered with
+#   allow_concat_dir(), holding only `file '<name>'` lines naming plain files in
+#   that directory that sniff as media, and forces -safe 1;
+# - allows -f image2pipe only from stdin;
+# - runs the real binary with an empty environment.
+_WRAPPER = r"""#!__PY__ -IS
+# media_guard wrapper (generated; see media_guard.py)
+import os, re, sys
+REAL = __REAL__
+TOOL = __TOOL__
+PW = __PW__
+FW = __FW__
+DIRS_FILE = __DIRS__
+MG_DIR = __MGDIR__
+SAFE_PATH = __SAFEPATH__
+PASS = __PASS__
+NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,200}$")
 
-_FFPROBE_WRAPPER = r"""#!/bin/bash
-# media_guard ffprobe wrapper: whitelists on the input, empty environment.
-pre=()
-case " $* " in *" -protocol_whitelist "*) ;; *) pre+=("-protocol_whitelist" "__PW__") ;; esac
-case " $* " in *" -format_whitelist "*) ;; *) pre+=("-format_whitelist" "__FW__") ;; esac
-exec /usr/bin/env -i __ENV__ "__REAL__" "${pre[@]}" "$@"
+
+def die(msg):
+    sys.stderr.write("media_guard: " + msg + "\n")
+    sys.exit(2)
+
+
+def concat_dirs():
+    try:
+        with open(DIRS_FILE) as f:
+            return [os.path.realpath(d) for d in f.read().splitlines() if d.strip()]
+    except OSError:
+        return []
+
+
+def check_concat(src):
+    lst = os.path.realpath(src)
+    base = os.path.dirname(lst)
+    if not any(base == d or base.startswith(d + os.sep) for d in concat_dirs()):
+        die("concat list outside a registered work dir refused")
+    try:
+        with open(lst, "rb") as f:
+            text = f.read(1024 * 1024 + 1).decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        die("unreadable concat list")
+    sys.path.insert(0, MG_DIR)
+    import media_guard as mg
+    files = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line == "ffconcat version 1.0":
+            continue
+        word, _, rest = line.partition(" ")
+        rest = rest.strip()
+        if word in ("duration", "inpoint", "outpoint"):
+            try:
+                float(rest)
+            except ValueError:
+                die("bad concat directive")
+            continue
+        if word != "file" or len(rest) < 3 or rest[0] != "'" or rest[-1] != "'" or not NAME.match(rest[1:-1]):
+            die("concat entries must be file '<name>' in the list's own directory")
+        path = os.path.join(base, rest[1:-1])
+        if os.path.islink(path) or not os.path.isfile(path):
+            die("concat entry is not a plain file")
+        with open(path, "rb") as f:
+            if mg.detect_format(f.read(64 * 1024)) not in mg.AV_FORMATS:
+                die("concat entry is not media")
+        files += 1
+    if not files:
+        die("empty concat list")
+
+
+def main():
+    argv = sys.argv[1:]
+    out = []
+    fmt = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-protocol_whitelist", "-format_whitelist"):
+            want = PW if a == "-protocol_whitelist" else FW
+            if i + 1 >= len(argv) or argv[i + 1] != want:
+                die("caller-supplied " + a + " refused")
+            i += 2
+            continue
+        if a in ("-pattern_type", "-enable_drefs"):
+            die(a + " refused")
+        if a == "-safe":
+            i += 2
+            continue
+        if a == "-f" and i + 1 < len(argv):
+            fmt = argv[i + 1]
+            if TOOL == "ffprobe" and fmt in ("concat", "image2pipe"):
+                die("-f " + fmt + " refused")
+        if a == "-i" and TOOL == "ffmpeg":
+            if i + 1 >= len(argv):
+                die("-i without an input")
+            src = argv[i + 1]
+            if fmt == "concat":
+                check_concat(src)
+                out += ["-protocol_whitelist", "file", "-format_whitelist", FW + ",concat", "-safe", "1"]
+            elif fmt == "image2pipe":
+                if src not in ("-", "pipe:", "pipe:0", "fd:0"):
+                    die("image2pipe only from stdin")
+                out += ["-protocol_whitelist", PW, "-format_whitelist", FW + ",image2pipe"]
+            else:
+                out += ["-protocol_whitelist", PW, "-format_whitelist", FW]
+            out += ["-i", src]
+            fmt = None
+            i += 2
+            continue
+        out.append(a)
+        i += 1
+    if TOOL == "ffprobe":
+        out = ["-protocol_whitelist", PW, "-format_whitelist", FW] + out
+    env = {"PATH": SAFE_PATH}
+    for k in PASS:
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    os.execve(REAL, [REAL] + out, env)
+
+
+main()
 """
 
 _state = {}
+_MG_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _env_assignments() -> str:
-    parts = [f'PATH="{SAFE_PATH}"']
-    for k in _PASSTHROUGH_ENV:
-        parts.append(f'${{{k}:+{k}="${k}"}}')
-    return " ".join(parts)
+_MARKER = b"# media_guard wrapper"
 
 
-def _write_wrapper(path: str, template: str, real: str) -> None:
-    for bad in ('"', "$", "`", "\\", "\n"):
-        if bad in real:
-            raise RuntimeError("unexpected character in the ffmpeg path")
-    body = (template.replace("__PW__", PROTOCOL_WHITELIST).replace("__FW__", FORMAT_WHITELIST)
-            .replace("__ENV__", _env_assignments()).replace("__REAL__", real))
+def is_guard_wrapper(path: Optional[str]) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return _MARKER in f.read(256)
+    except (OSError, TypeError):
+        return False
+
+
+def real_binary(name: str) -> Optional[str]:
+    """The first `name` on PATH that is not a media_guard wrapper."""
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d:
+            continue
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) and not is_guard_wrapper(cand):
+            return cand
+    return None
+
+
+def _write_wrapper(path: str, tool: str, real: str, dirs_file: str) -> None:
+    if is_guard_wrapper(real):
+        raise RuntimeError("refusing to wrap a media_guard wrapper")
+    py = os.path.realpath(sys.executable)
+    if any(c in py for c in (" ", "\n")):
+        raise RuntimeError("unexpected character in the python path")
+    body = (_WRAPPER.replace("__PY__", py).replace("__REAL__", repr(real)).replace("__TOOL__", repr(tool))
+            .replace("__PW__", repr(PROTOCOL_WHITELIST)).replace("__FW__", repr(FORMAT_WHITELIST))
+            .replace("__DIRS__", repr(dirs_file)).replace("__MGDIR__", repr(_MG_DIR))
+            .replace("__SAFEPATH__", repr(SAFE_PATH)).replace("__PASS__", repr(_PASSTHROUGH_ENV)))
     with open(path, "w") as f:
         f.write(body)
     os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+
+
+def allow_concat_dir(path: str) -> None:
+    """Let the ffmpeg wrapper accept OUR concat list in this work dir (see _WRAPPER)."""
+    if not _state.get("installed"):
+        raise RuntimeError("install_ffmpeg_guard() first")
+    with open(_state["concat_dirs"], "a") as f:
+        f.write(os.path.realpath(path) + "\n")
+
+
+def clear_concat_dirs() -> None:
+    if _state.get("installed"):
+        open(_state["concat_dirs"], "w").close()
 
 
 def _imageio_ffmpeg_exe() -> Optional[str]:
@@ -459,24 +612,29 @@ def install_ffmpeg_guard(
     """
     if _state.get("installed") and not (real_ffmpeg or real_ffprobe or bin_dir):
         return dict(_state)
-    path_dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d and d != _state.get("bin_dir")]
-    clean_path = os.pathsep.join(path_dirs)
-    real_ffmpeg = real_ffmpeg or shutil.which("ffmpeg", path=clean_path)
-    real_ffprobe = real_ffprobe or shutil.which("ffprobe", path=clean_path)
-    real_imageio = real_imageio_ffmpeg or _imageio_ffmpeg_exe() or real_ffmpeg
+    path_dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep)
+                 if d and not is_guard_wrapper(os.path.join(d, "ffmpeg")) and not is_guard_wrapper(os.path.join(d, "ffprobe"))]
+    real_ffmpeg = real_ffmpeg or real_binary("ffmpeg")
+    real_ffprobe = real_ffprobe or real_binary("ffprobe")
+    imageio_exe = _imageio_ffmpeg_exe()
+    if is_guard_wrapper(imageio_exe):
+        imageio_exe = _state.get("real_imageio_ffmpeg")
+    real_imageio = real_imageio_ffmpeg or imageio_exe or real_ffmpeg
     bin_dir = bin_dir or tempfile.mkdtemp(prefix="media-guard-bin-")
     os.makedirs(bin_dir, exist_ok=True)
-    info = {"installed": True, "bin_dir": bin_dir}
+    dirs_file = os.path.join(bin_dir, "concat-dirs")
+    open(dirs_file, "w").close()
+    info = {"installed": True, "bin_dir": bin_dir, "concat_dirs": dirs_file, "real_imageio_ffmpeg": real_imageio}
     if real_ffmpeg:
-        _write_wrapper(os.path.join(bin_dir, "ffmpeg"), _FFMPEG_WRAPPER, os.path.realpath(real_ffmpeg))
+        _write_wrapper(os.path.join(bin_dir, "ffmpeg"), "ffmpeg", os.path.realpath(real_ffmpeg), dirs_file)
         info["ffmpeg"] = os.path.join(bin_dir, "ffmpeg")
     if real_ffprobe:
-        _write_wrapper(os.path.join(bin_dir, "ffprobe"), _FFPROBE_WRAPPER, os.path.realpath(real_ffprobe))
+        _write_wrapper(os.path.join(bin_dir, "ffprobe"), "ffprobe", os.path.realpath(real_ffprobe), dirs_file)
         info["ffprobe"] = os.path.join(bin_dir, "ffprobe")
     if real_imageio:
         sub = os.path.join(bin_dir, "imageio")
         os.makedirs(sub, exist_ok=True)
-        _write_wrapper(os.path.join(sub, "ffmpeg"), _FFMPEG_WRAPPER, os.path.realpath(real_imageio))
+        _write_wrapper(os.path.join(sub, "ffmpeg"), "ffmpeg", os.path.realpath(real_imageio), dirs_file)
         info["imageio_ffmpeg"] = os.path.join(sub, "ffmpeg")
         os.environ["IMAGEIO_FFMPEG_EXE"] = info["imageio_ffmpeg"]
         os.environ["FFMPEG_BINARY"] = info["imageio_ffmpeg"]
