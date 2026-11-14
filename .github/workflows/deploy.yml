@@ -32,23 +32,44 @@ jobs:
   deploy:
     needs: test
     if: github.event_name != 'pull_request'
+    outputs:
+      pushed: ${{ steps.cli_token.outputs.has_token }}
     runs-on: ubuntu-latest
     
     steps:
+      - name: Check REPLICATE_CLI_AUTH_TOKEN
+        id: cli_token
+        # `cog login` rejects Replicate API tokens (r8_...); it needs a CLI auth
+        # token from https://replicate.com/auth/token. Until that secret exists,
+        # skip the push cleanly (job stays green) instead of failing red.
+        env:
+          REPLICATE_CLI_AUTH_TOKEN: ${{ secrets.REPLICATE_CLI_AUTH_TOKEN }}
+        run: |
+          if [ -n "$REPLICATE_CLI_AUTH_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping cog push: add the REPLICATE_CLI_AUTH_TOKEN secret (replicate.com/auth/token)"
+          fi
       - name: Checkout code
+        if: steps.cli_token.outputs.has_token == 'true'
         uses: actions/checkout@v4
         
       - name: Set up Cog
+        if: steps.cli_token.outputs.has_token == 'true'
         uses: replicate/setup-cog@v2
         with:
-          token: ${{ secrets.REPLICATE_API_TOKEN }}
+          token: ${{ secrets.REPLICATE_CLI_AUTH_TOKEN }}
+          cog-version: v0.23.1
           
       - name: Debug - Check current location
+        if: steps.cli_token.outputs.has_token == 'true'
         run: |
           pwd
           ls -la
           
       - name: Deploy to Replicate
+        if: steps.cli_token.outputs.has_token == 'true'
         run: cog push r8.im/darrenrogan/cog-frame-extractor
         env:
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
