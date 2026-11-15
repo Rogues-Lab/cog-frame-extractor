@@ -73,3 +73,5 @@ jobs:
         run: cog push r8.im/darrenrogan/cog-frame-extractor
         env:
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+          # r8.im rejects the OCI index buildx makes when it adds provenance/SBOM attestations.
+          BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
